@@ -1,0 +1,8 @@
+node_modules
+.nuxt
+.output
+.data
+data/*.db*
+dist
+*.log
+docs/transcript/*.jsonl

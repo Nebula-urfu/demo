@@ -1,0 +1,229 @@
+---
+title: Контракт Nuxt ↔ Core. Сквозной сценарий закупки по операциям API
+---
+sequenceDiagram
+    autonumber
+
+    actor R as Житель
+    actor S as Сотрудник УК
+    actor V as Проверяющий
+    participant U as Nuxt + BFF
+    participant C as Core
+    participant D as Documents
+    participant F as Reference Data
+    participant Q as RabbitMQ
+    participant A as AI Assistant
+    participant N as Notifications
+
+    Note over U,C: Все вызовы с токеном пользователя, org_id и роль берутся из токена. При 401 BFF обновляет сессию и повторяет запрос один раз
+
+    rect rgb(247, 247, 247)
+    Note over R,N: 1. Подача заявки, кабинет жителя
+    R->>U: Фото, описание, подъезд
+    U->>D: Загрузка фото
+    D-->>U: file_id для каждого фото
+    U->>C: POST /requests, Idempotency-Key, description, entrance, photoFileIds
+    C->>C: Адрес берётся из профиля жителя, статус ACCEPTED, шаг TRIAGE в PROCESSING
+    C-->>U: 201 RequestDetail
+    U-->>R: Карточка заявки, статус «принята»
+    C->>F: Шаблон ТЗ, справочник работ и норм
+    F-->>C: Шаблоны и нормы
+    C-)Q: ai.jobs: triage_and_tz_draft, file_id, sha256, текст, справочные данные
+    end
+
+    rect rgb(240, 240, 240)
+    Note over R,N: 2. Автоматическая обработка AI
+    Q-)A: Задача
+    loop для каждого file_id
+        A->>D: Запрос доступа к file_id, org_id и сервисный токен с scope documents:read
+        D-->>A: Короткоживущая ссылка на Silo, размер, sha256
+        Note right of A: AI скачивает файл по ссылке и сверяет sha256. Сервисный токен выдаёт Access
+    end
+    A->>A: Триаж, анализ фото, черновик ТЗ, вопросы
+    A-)Q: ai.results: triage, tz_draft, open_questions, draft = true
+    Q-)C: Результат
+    C->>C: Предложение триажа, версия ТЗ 1, шаг TZ в DRAFT_READY
+    alt Аварийная заявка
+        C-)N: Срочное событие
+        N-)S: Web push, срочное уведомление
+    else Плановая работа
+        C-)N: Событие, предварительный результат готов
+        N-)S: Web push, по заявке готов предварительный результат
+    end
+    end
+
+    rect rgb(247, 247, 247)
+    Note over R,N: 3. Кабинет сотрудника УК, триаж и ТЗ
+    S->>U: Открывает «Входящие заявки»
+    U->>C: GET /requests, срочные сверху
+    C-->>U: RequestPage
+    S->>U: Открывает карточку заявки
+    U->>C: GET /requests/{requestId}
+    C-->>U: RequestDetail, steps, photos
+    C->>C: Статус для жителя IN_PROGRESS
+    R->>U: Открывает «Мои заявки»
+    U->>C: GET /requests/{requestId}
+    C-->>U: Статус «в работе»
+    S->>U: Подтверждение маршрута
+    U->>C: GET /requests/{requestId}/triage
+    C-->>U: proposal от AI
+    U->>C: POST /requests/{requestId}/triage/confirm, urgency, workType, route
+    C-->>U: Triage, confirmed
+    S->>U: Открывает «Редактор ТЗ»
+    U->>C: GET /requests/{requestId}/tz
+    C-->>U: TzDocument, sections, openQuestions, version
+    loop Пока сотрудник правит
+        U->>C: PUT /requests/{requestId}/tz, baseVersion, sections, answers
+        C-->>U: Новая версия ТЗ
+        Note over U,C: Если baseVersion устарела, ответ 409 STALE_VERSION и фронтенд перезагружает ТЗ
+    end
+    U->>C: POST /requests/{requestId}/tz/submit, version
+    C-->>U: 201 Approval, state PENDING
+    C-)N: Задача на проверку
+    N-)V: Web push
+    end
+
+    rect rgb(240, 240, 240)
+    Note over R,N: 4. Кабинет проверяющего, проверка ТЗ
+    V->>U: Открывает «Очередь на проверку»
+    U->>C: GET /approvals, state = PENDING
+    C-->>U: ApprovalPage
+    V->>U: Открывает экран проверки
+    U->>C: GET /approvals/{approvalId}
+    C-->>U: ApprovalDetail, subject = TzDocument, previousDecisions
+    alt ТЗ полное
+        U->>C: POST /approvals/{approvalId}/approve, subjectVersion
+        C->>C: Запись в журнал согласований, шаг TZ в APPROVED
+        C-->>U: Approval, state APPROVED
+        C-)N: ТЗ утверждено
+        N-)S: Web push
+    else Доработать
+        U->>C: POST /approvals/{approvalId}/reject, subjectVersion, comment
+        C->>C: Запись в журнал, шаг TZ снова в PROCESSING
+        C-->>U: Approval, state REJECTED
+        C-)Q: ai.jobs: tz_revision, текущая версия и комментарий
+        Q-)A: Задача
+        A-)Q: ai.results: обновлённый tz_draft и вопросы
+        Q-)C: Результат
+        C->>C: Новая версия ТЗ, шаг в DRAFT_READY
+        C-)N: Комментарий и обновлённый черновик
+        N-)S: Web push, сотрудник повторяет правку и отправку из раздела 3
+    end
+    end
+
+    rect rgb(247, 247, 247)
+    Note over R,N: 5. Модуль Б, КП и НМЦ
+    S->>U: «Запрос КП», выбирает подрядчиков
+    U->>C: POST /requests/{requestId}/quote-requests, contractorIds
+    C->>F: Контакты подрядчиков, шаблон письма и формы КП
+    F-->>C: Данные
+    C-->>U: 201 QuoteRequestDraft, письмо с ТЗ и формой КП
+    Note over S: Письмо отправляется подрядчикам вне системы, канал не определён, КП приходят в любом формате
+    S->>U: «Загрузка КП», файлы предложений
+    U->>D: Загрузка файлов КП
+    D-->>U: file_id
+    U->>C: POST /requests/{requestId}/quotes, fileIds, contractorId
+    C-->>U: 202 Quote, extraction EXTRACTING
+    C-)Q: ai.jobs: quotes_extraction, file_id, sha256, утверждённое ТЗ
+    Q-)A: Задача
+    A-)Q: ai.results: цены, условия, подсказки по расхождениям
+    Q-)C: Результат
+    C->>C: Quote, extraction EXTRACTED, данные как черновик
+    C-)N: КП обработано
+    N-)S: Web push
+    U->>C: GET /requests/{requestId}/quotes
+    C-->>U: Список КП с извлечёнными данными
+    opt Сотрудник исправляет данные
+        U->>C: PUT /requests/{requestId}/quotes/{quoteId}/data, baseVersion, data
+        C-->>U: Quote, editedByStaff
+    end
+    U->>C: GET /requests/{requestId}/quotes/comparison
+    C-->>U: QuoteComparison, цена, сроки, гарантия, расхождения
+    U->>C: POST /requests/{requestId}/nmc/calculate, method, quoteIds
+    C->>C: Детерминированный расчёт без AI
+    C-->>U: 200 NmcCalculation, amount, justification
+    U->>C: POST /requests/{requestId}/nmc/submit, version
+    C-->>U: 201 Approval
+    C-)N: Задача на проверку
+    N-)V: Web push
+    V->>U: Экран проверки
+    U->>C: GET /approvals/{approvalId}
+    C-->>U: subject = NmcCalculation
+    alt Цены адекватны
+        U->>C: POST /approvals/{approvalId}/approve, subjectVersion
+        C->>C: Журнал согласований, шаг QUOTES_NMC в APPROVED
+        C-->>U: Approval, state APPROVED
+    else Доработать
+        U->>C: POST /approvals/{approvalId}/reject, comment
+        C->>C: Журнал, шаг QUOTES_NMC в NEEDS_REWORK
+        C-->>U: Approval, state REJECTED
+        C-)N: Комментарий проверяющего
+        N-)S: Web push, сотрудник правит КП, пересчитывает и отправляет заново
+    end
+    end
+
+    rect rgb(240, 240, 240)
+    Note over R,N: 6. Модуль В, конкурс, победитель, договор
+    C->>F: Шаблоны, критерии оценки, библиотека договоров
+    F-->>C: Справочные данные
+    C-)Q: ai.jobs: tender_package, ТЗ, КП, НМЦ
+    Q-)A: Задача, запускается автоматически после утверждения НМЦ
+    A-)Q: ai.results: конкурсная документация, предложение победителя, протокол оценки
+    Q-)C: Результат
+    C->>C: Шаг TENDER в DRAFT_READY
+    C-)N: Результат готов
+    N-)S: Web push
+    S->>U: Экран «Выбор победителя»
+    U->>C: GET /requests/{requestId}/tender
+    C-->>U: Tender, winnerProposal, documents
+    U->>C: PUT /requests/{requestId}/tender/winner, quoteId, comment
+    alt Договор типовой
+        C->>F: Типовой договор по виду работ
+        F-->>C: Договор из библиотеки
+        C->>C: contract.type = STANDARD
+    else Договор нетиповой
+        C-)Q: ai.jobs: contract_draft
+        Q-)A: Задача
+        A-)Q: ai.results: черновик договора, пометки для юриста
+        Q-)C: Результат
+        C->>C: contract.type = NON_STANDARD, lawyerNotes
+    end
+    C-->>U: Tender, selectedWinner, contract
+    C->>D: Сборка документов пакета
+    D-->>C: file_id документов
+    U->>C: GET /requests/{requestId}/package
+    C-->>U: ProcurementPackage, ТЗ, форма КП, проект договора, протокол оценки
+    U->>C: POST /requests/{requestId}/package/submit, version
+    C-->>U: 201 Approval
+    C-)N: Пакет на утверждение
+    N-)V: Web push
+    V->>U: Экран проверки
+    U->>C: GET /approvals/{approvalId}
+    C-->>U: subject = ProcurementPackage
+    alt Утвердить пакет
+        U->>C: POST /approvals/{approvalId}/approve, subjectVersion
+        C->>C: Журнал согласований, шаг PACKAGE в APPROVED
+        C-->>U: Approval, state APPROVED
+    else Доработать
+        U->>C: POST /approvals/{approvalId}/reject, comment
+        C->>C: Журнал, шаг PACKAGE в NEEDS_REWORK
+        C-)N: Комментарий проверяющего
+        N-)S: Web push, сотрудник правит и отправляет заново
+    end
+    end
+
+    rect rgb(247, 247, 247)
+    Note over R,N: 7. Готовый пакет
+    C-)N: Пакет готов
+    N-)S: Web push
+    C->>C: Статус для жителя COMPLETED, момент уточняется
+    S->>U: Открывает «Готовый пакет»
+    U->>C: GET /requests/{requestId}/package
+    C-->>U: documents с file_id
+    S->>U: Скачать все документы или по одному
+    U->>D: Скачивание по file_id
+    D-->>U: Файлы
+    V->>U: Открывает «Журнал согласований»
+    U->>C: GET /approval-journal, requestId
+    C-->>U: JournalPage, кто, что и когда утвердил
+    end

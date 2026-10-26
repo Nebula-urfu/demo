@@ -1,0 +1,35 @@
+---
+title: Контракт Nuxt ↔ Core. Состояния заявки и шагов закупки
+---
+stateDiagram-v2
+    direction LR
+
+    state "Статус заявки, который видит житель" as RS {
+        [*] --> ACCEPTED: заявка подана
+        ACCEPTED --> IN_PROGRESS: сотрудник открыл карточку
+        IN_PROGRESS --> COMPLETED: пакет утверждён, момент уточняется
+        COMPLETED --> [*]
+    }
+
+    state "Состояние шага закупки, StepState" as SS {
+        [*] --> NOT_STARTED
+        NOT_STARTED --> PROCESSING: старт AI автоматически
+        PROCESSING --> DRAFT_READY: результат AI, это черновик
+        PROCESSING --> AI_FAILED: сбой AI
+        AI_FAILED --> PROCESSING: POST steps/step/restart, STAFF
+        DRAFT_READY --> DRAFT_READY: правка сотрудником, новая версия
+        DRAFT_READY --> IN_REVIEW: POST submit, STAFF
+        IN_REVIEW --> APPROVED: POST approve, REVIEWER
+        IN_REVIEW --> PROCESSING: POST reject для ТЗ, AI дорабатывает
+        IN_REVIEW --> NEEDS_REWORK: POST reject для НМЦ и пакета
+        NEEDS_REWORK --> DRAFT_READY: правка сотрудником
+        APPROVED --> [*]
+    }
+
+    note right of SS
+        Шаги по порядку: TRIAGE, TZ, QUOTES_NMC, TENDER, PACKAGE.
+        Утверждают проверяющий: TZ, NMC, PACKAGE.
+        TRIAGE подтверждает сам сотрудник.
+        APPROVED запускает следующий шаг.
+        Устаревшая версия при submit или approve даёт 409 STALE_VERSION.
+    end note

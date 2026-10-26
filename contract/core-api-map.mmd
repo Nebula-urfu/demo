@@ -1,0 +1,100 @@
+---
+title: Контракт Nuxt ↔ Core. Экраны, операции API и связи Core
+---
+flowchart LR
+    classDef res fill:#fff5ed,stroke:#9b4a08,color:#1a1a1a
+    classDef staff fill:#f0f5fd,stroke:#305bab,color:#1a1a1a
+    classDef rev fill:#f4f2fd,stroke:#6631d7,color:#1a1a1a
+    classDef api fill:#adf0c7,stroke:#067429,color:#1a1a1a
+    classDef ext fill:#ffffff,stroke:#595959,color:#1a1a1a,stroke-dasharray:5 5
+    classDef ai fill:#fff6b6,stroke:#af7e04,color:#1a1a1a
+    classDef gate fill:#e7e7e7,stroke:#808080,color:#1a1a1a
+
+    LEG["Условные обозначения<br/>Оранжевые экраны: житель, синие: сотрудник УК, фиолетовые: проверяющий<br/>Сплошная линия: HTTP-вызов с токеном пользователя<br/>Пунктир: событие через очередь или вызов другого сервиса<br/>Все пути под /api/v1, org_id берётся из токена и в путях его нет"]
+
+    subgraph NUXT["Nuxt PWA"]
+        subgraph RES["Кабинет жителя"]
+            R1["Новая заявка"]:::res
+            R2["Мои заявки"]:::res
+            R3["Карточка заявки: статус по шагам"]:::res
+        end
+        subgraph STF["Кабинет сотрудника УК"]
+            S1["Входящие заявки и история закупок"]:::staff
+            S2["Карточка заявки"]:::staff
+            S3["Подтверждение маршрута, аварийная заявка"]:::staff
+            S4["Редактор ТЗ"]:::staff
+            S5["Запрос КП, загрузка КП, сравнение"]:::staff
+            S6["Расчёт НМЦ"]:::staff
+            S7["Выбор победителя и договор"]:::staff
+            S8["Готовый пакет"]:::staff
+        end
+        subgraph REVW["Кабинет проверяющего"]
+            V1["Очередь на проверку"]:::rev
+            V2["Экран проверки"]:::rev
+            V3["Журнал согласований"]:::rev
+        end
+    end
+
+    BFF["BFF<br/>проверка сессии, проброс токена<br/>форма запросов и ответов не меняется"]:::gate
+
+    subgraph CORE["Procurement Core, API /api/v1"]
+        A1["Requests<br/>GET /requests<br/>POST /requests, Idempotency-Key<br/>GET /requests/{requestId}<br/>POST /requests/{requestId}/steps/{step}/restart"]:::api
+        A2["Triage<br/>GET /requests/{requestId}/triage<br/>POST /requests/{requestId}/triage/confirm"]:::api
+        A3["TZ<br/>GET и PUT /requests/{requestId}/tz<br/>POST /requests/{requestId}/tz/submit"]:::api
+        A4["Quotes<br/>POST /requests/{requestId}/quote-requests<br/>GET и POST /requests/{requestId}/quotes<br/>GET /requests/{requestId}/quotes/comparison<br/>PUT /requests/{requestId}/quotes/{quoteId}/data<br/>DELETE /requests/{requestId}/quotes/{quoteId}"]:::api
+        A5["НМЦ<br/>GET /requests/{requestId}/nmc<br/>POST /requests/{requestId}/nmc/calculate<br/>POST /requests/{requestId}/nmc/submit"]:::api
+        A6["Tender<br/>GET /requests/{requestId}/tender<br/>PUT /requests/{requestId}/tender/winner"]:::api
+        A7["Package<br/>GET /requests/{requestId}/package<br/>POST /requests/{requestId}/package/submit"]:::api
+        A8["Approvals<br/>GET /approvals<br/>GET /approvals/{approvalId}<br/>POST /approvals/{approvalId}/approve<br/>POST /approvals/{approvalId}/reject<br/>GET /approval-journal"]:::api
+    end
+
+    DOC["Documents<br/>загрузка фото и КП, file_id<br/>скачивание файлов и пакета"]:::ext
+    REF["Reference Data<br/>подрядчики, шаблоны, нормы"]:::ext
+    AI["AI Assistant"]:::ai
+    NOTIF["Notifications<br/>web push"]:::ext
+
+    %% экраны жителя
+    R1 --> BFF
+    R2 --> BFF
+    R3 --> BFF
+    %% экраны сотрудника
+    S1 --> BFF
+    S2 --> BFF
+    S3 --> BFF
+    S4 --> BFF
+    S5 --> BFF
+    S6 --> BFF
+    S7 --> BFF
+    S8 --> BFF
+    %% экраны проверяющего
+    V1 --> BFF
+    V2 --> BFF
+    V3 --> BFF
+
+    %% BFF к группам операций
+    BFF -->|"создание, список, карточка"| A1
+    BFF -->|"триаж"| A2
+    BFF -->|"правка и отправка ТЗ"| A3
+    BFF -->|"КП и сравнение"| A4
+    BFF -->|"расчёт и отправка НМЦ"| A5
+    BFF -->|"победитель и договор"| A6
+    BFF -->|"пакет"| A7
+    BFF -->|"очередь, решение, журнал"| A8
+
+    %% отправка на проверку создаёт задачу
+    A3 -->|"submit создаёт задачу проверки"| A8
+    A5 -->|"submit создаёт задачу проверки"| A8
+    A7 -->|"submit создаёт задачу проверки"| A8
+    A8 -->|"approve: шаг APPROVED, запуск следующего"| A1
+    A8 -.->|"reject ТЗ: комментарий в AI"| AI
+
+    %% внешние сервисы
+    BFF -->|"загрузка фото и КП, скачивание"| DOC
+    A1 -.->|"версии ТЗ, КП, сборка пакета"| DOC
+    A4 -.->|"подрядчики, шаблоны письма"| REF
+    A3 -.->|"шаблоны и нормы"| REF
+    A1 -.->|"ai.jobs: триаж и ТЗ, извлечение КП, документация"| AI
+    AI -.->|"ai.results: черновики"| A1
+    A8 -.->|"события: на проверку, утверждено, пакет готов"| NOTIF
+    A1 -.->|"событие: срочная заявка"| NOTIF
+    NOTIF -.->|"web push, повторный запрос состояния шага"| BFF

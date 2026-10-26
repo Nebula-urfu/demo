@@ -1,0 +1,1633 @@
+openapi: 3.1.0
+info:
+  title: YKit Core API
+  version: 0.1.0
+  description: |
+    Контракт между Nuxt-приложением (через BFF) и Procurement Core.
+    Предложение, составленное по доске YKit; поля и значения, помеченные как открытые, нужно подтвердить.
+
+    Допущения:
+    - BFF только пробрасывает токен пользователя и не меняет форму запросов и ответов.
+    - Организация (`org_id`) и роли берутся из access-токена. В путях и телах `org_id` нет: все данные
+      автоматически ограничены организацией пользователя, чужая заявка отвечает 404.
+    - Файлы (фото, КП) загружаются в сервис Documents. В Core передаются только `fileId`.
+      Скачивание файлов и пакета идёт через Documents, этот контракт его не описывает.
+    - Результат AI всегда черновик. Состояние шага меняют только действия человека и события AI.
+    - Шаги AI (триаж и ТЗ, извлечение из КП, конкурсная документация) стартуют автоматически.
+      Фронтенд узнаёт о готовности по web push или повторным запросом состояния шага.
+
+    Роли (`x-roles` у операций): RESIDENT (житель), STAFF (сотрудник УК), REVIEWER (проверяющий).
+    Точные значения ролей определяются OIDC-провайдером и должны совпасть с этими именами.
+
+    Состояния шага (StepState):
+    NOT_STARTED -> PROCESSING (работает AI) -> DRAFT_READY -> IN_REVIEW -> APPROVED или NEEDS_REWORK.
+    Из PROCESSING возможен AI_FAILED, из него выход через перезапуск шага. Если проверяющий возвращает ТЗ,
+    шаг сразу уходит в PROCESSING (AI дорабатывает по комментарию). Если возвращает НМЦ или пакет, шаг получает
+    NEEDS_REWORK, после правки сотрудника он снова DRAFT_READY. Не каждое состояние применимо к каждому шагу.
+servers:
+  - url: /api/v1
+    description: Путь, который видит браузер. BFF проксирует его в Core.
+security:
+  - bearerAuth: []
+
+tags:
+  - name: Requests
+    description: Заявки жителей и входящие сотрудника УК
+  - name: Triage
+    description: Триаж и подтверждение маршрута
+  - name: TZ
+    description: Модуль А, техническое задание
+  - name: Quotes
+    description: Модуль Б, КП и НМЦ
+  - name: Tender
+    description: Модуль В, конкурс, победитель, договор
+  - name: Package
+    description: Готовый пакет документов
+  - name: Approvals
+    description: Очередь проверки и журнал согласований
+
+paths:
+  /requests:
+    get:
+      tags: [Requests]
+      operationId: listRequests
+      summary: Список заявок
+      description: |
+        Житель видит только свои заявки. Сотрудник УК и проверяющий видят заявки своей организации,
+        срочные сверху. Для сотрудника это экраны «Входящие заявки» и «История закупок».
+      x-roles: [RESIDENT, STAFF, REVIEWER]
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+        - name: status
+          in: query
+          schema:
+            $ref: '#/components/schemas/RequestStatus'
+        - name: urgency
+          in: query
+          schema:
+            $ref: '#/components/schemas/Urgency'
+        - name: step
+          in: query
+          description: Текущий шаг. Только для сотрудника и проверяющего.
+          schema:
+            $ref: '#/components/schemas/ProcurementStep'
+        - name: q
+          in: query
+          description: Поиск по адресу и описанию. Только для сотрудника и проверяющего.
+          schema:
+            type: string
+            maxLength: 200
+        - name: createdFrom
+          in: query
+          schema:
+            type: string
+            format: date
+        - name: createdTo
+          in: query
+          schema:
+            type: string
+            format: date
+      responses:
+        '200':
+          description: Страница заявок
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RequestPage'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [Requests]
+      operationId: createRequest
+      summary: Подать заявку
+      description: |
+        Только житель. Адрес берётся из профиля жителя на сервере, поэтому подать заявку на другой дом нельзя.
+        Фото сначала загружаются в Documents. После создания автоматически стартует триаж и черновик ТЗ.
+        Открытый вопрос: как Core получает адрес жителя (claim в токене или запрос к Profiles & Access).
+      x-roles: [RESIDENT]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RequestCreate'
+      responses:
+        '201':
+          description: Заявка принята, статус ACCEPTED
+          headers:
+            Location:
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RequestDetail'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /requests/{requestId}:
+    parameters:
+      - $ref: '#/components/parameters/RequestId'
+    get:
+      tags: [Requests]
+      operationId: getRequest
+      summary: Карточка заявки
+      description: |
+        Житель видит статус по шагам (ACCEPTED, IN_PROGRESS, COMPLETED), фото и описание. Поля `steps`,
+        `triage`, `author` и всё внутреннее содержимое закупки только для сотрудника и проверяющего,
+        для жителя они отсутствуют в ответе.
+      x-roles: [RESIDENT, STAFF, REVIEWER]
+      responses:
+        '200':
+          description: Заявка
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RequestDetail'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /requests/{requestId}/steps/{step}/restart:
+    parameters:
+      - $ref: '#/components/parameters/RequestId'
+      - name: step
+        in: path
+        required: true
+        description: Шаг, который выполняет AI.
+        schema:
+          type: string
+          enum: [TRIAGE, TZ, QUOTES_NMC, TENDER]
+    post:
+      tags: [Requests]
+      operationId: restartAiStep
+      summary: Перезапустить шаг AI после сбоя
+      description: Допустимо только в состоянии AI_FAILED. Добавлено мной, на доске случая сбоя AI нет.
+      x-roles: [STAFF]
+      responses:
+        '202':
+          description: Шаг снова в состоянии PROCESSING
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StepInfo'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /requests/{requestId}/triage:
+    parameters:
+      - $ref: '#/components/parameters/RequestId'
+    get:
+      tags: [Triage]
+      operationId: getTriage
+      summary: Результат триажа
+      description: Предложение AI и, если сотрудник уже подтвердил, итоговое решение. Для аварийной заявки на фронтенде показывается экран «Аварийная заявка».
+      x-roles: [STAFF, REVIEWER]
+      responses:
+        '200':
+          description: Триаж
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Triage'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /requests/{requestId}/triage/confirm:
+    parameters:
+      - $ref: '#/components/parameters/RequestId'
+    post:
+      tags: [Triage]
+      operationId: confirmTriage
+      summary: Подтвердить или изменить маршрут
+      description: Сотрудник соглашается с предложением AI или передаёт свои значения.
+      x-roles: [STAFF]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TriageDecision'
+      responses:
+        '200':
+          description: Триаж подтверждён
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Triage'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /requests/{requestId}/tz:
+    parameters:
+      - $ref: '#/components/parameters/RequestId'
+    get:
+      tags: [TZ]
+      operationId: getTz
+      summary: Текущая версия ТЗ
+      description: 'Состояния шага: NOT_STARTED, PROCESSING, DRAFT_READY, IN_REVIEW, NEEDS_REWORK, APPROVED, AI_FAILED.'
+      x-roles: [STAFF, REVIEWER]
+      responses:
+        '200':
+          description: ТЗ
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TzDocument'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    put:
+      tags: [TZ]
+      operationId: updateTz
+      summary: Сохранить правки ТЗ
+      description: |
+        Редактор ТЗ: ответы на уточняющие вопросы и правка разделов. Создаёт новую версию.
+        Допустимо в состоянии DRAFT_READY. Если `baseVersion` не совпадает с текущей, ответ 409 STALE_VERSION.
+      x-roles: [STAFF]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TzUpdate'
+      responses:
+        '200':
+          description: Новая версия ТЗ
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TzDocument'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /requests/{requestId}/tz/submit:
+    parameters:
+      - $ref: '#/components/parameters/RequestId'
+    post:
+      tags: [TZ]
+      operationId: submitTz
+      summary: Отправить ТЗ на проверку
+      description: Создаёт задачу проверки. Проверяющий получает уведомление.
+      x-roles: [STAFF]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SubmitForReview'
+      responses:
+        '201':
+          description: Задача проверки создана
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Approval'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /requests/{requestId}/quote-requests:
+    parameters:
+      - $ref: '#/components/parameters/RequestId'
+    post:
+      tags: [Quotes]
+      operationId: createQuoteRequest
+      summary: Подготовить запрос КП подрядчикам
+      description: |
+        Возвращает готовое письмо с ТЗ и формой КП. Сама отправка подрядчикам вне системы: канал на доске не определён,
+        сотрудник отправляет письмо сам. Допустимо после утверждения ТЗ. Идентификаторы подрядчиков берутся из Reference Data.
+      x-roles: [STAFF]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/QuoteRequestCreate'
+      responses:
+        '201':
+          description: Подготовленное письмо
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QuoteRequestDraft'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /requests/{requestId}/quotes:
+    parameters:
+      - $ref: '#/components/parameters/RequestId'
+    get:
+      tags: [Quotes]
+      operationId: listQuotes
+      summary: КП по заявке
+      x-roles: [STAFF, REVIEWER]
+      responses:
+        '200':
+          description: Список КП с извлечёнными данными
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Quote'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    post:
+      tags: [Quotes]
+      operationId: createQuote
+      summary: Загрузить КП
+      description: |
+        Файлы КП (PDF, Excel, письма) сначала загружаются в Documents. Регистрация КП запускает извлечение
+        цен и условий через AI. Допустимо, пока расчёт НМЦ не отправлен на проверку.
+      x-roles: [STAFF]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/QuoteCreate'
+      responses:
+        '202':
+          description: КП принято, извлечение выполняется
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Quote'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /requests/{requestId}/quotes/comparison:
+    parameters:
+      - $ref: '#/components/parameters/RequestId'
+    get:
+      tags: [Quotes]
+      operationId: getQuoteComparison
+      summary: Сравнение КП
+      description: 'Таблица: цена, сроки, гарантия, расхождения. Строится из текущих данных КП, включая правки сотрудника.'
+      x-roles: [STAFF, REVIEWER]
+      responses:
+        '200':
+          description: Сравнительная таблица
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QuoteComparison'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /requests/{requestId}/quotes/{quoteId}:
+    parameters:
+      - $ref: '#/components/parameters/RequestId'
+      - $ref: '#/components/parameters/QuoteId'
+    delete:
+      tags: [Quotes]
+      operationId: deleteQuote
+      summary: Удалить ошибочно загруженное КП
+      description: Допустимо, пока расчёт НМЦ не отправлен на проверку. Файл в Documents не удаляется.
+      x-roles: [STAFF]
+      responses:
+        '204':
+          description: Удалено
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /requests/{requestId}/quotes/{quoteId}/data:
+    parameters:
+      - $ref: '#/components/parameters/RequestId'
+      - $ref: '#/components/parameters/QuoteId'
+    put:
+      tags: [Quotes]
+      operationId: updateQuoteData
+      summary: Исправить извлечённые данные КП
+      description: Данные, извлечённые AI, это черновик. Сотрудник исправляет их перед расчётом НМЦ.
+      x-roles: [STAFF]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/QuoteDataUpdate'
+      responses:
+        '200':
+          description: КП с исправленными данными
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Quote'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /requests/{requestId}/nmc:
+    parameters:
+      - $ref: '#/components/parameters/RequestId'
+    get:
+      tags: [Quotes]
+      operationId: getNmc
+      summary: Расчёт НМЦ
+      x-roles: [STAFF, REVIEWER]
+      responses:
+        '200':
+          description: Текущий расчёт
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NmcCalculation'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /requests/{requestId}/nmc/calculate:
+    parameters:
+      - $ref: '#/components/parameters/RequestId'
+    post:
+      tags: [Quotes]
+      operationId: calculateNmc
+      summary: Рассчитать НМЦ
+      description: |
+        Детерминированный расчёт без участия AI, выполняется синхронно. Создаёт новую версию расчёта.
+        Метод расчёта и минимальное число КП зависят от ответа заказчика на вопрос 2 (открытый вопрос).
+      x-roles: [STAFF]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NmcCalculateRequest'
+      responses:
+        '200':
+          description: Расчёт
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NmcCalculation'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /requests/{requestId}/nmc/submit:
+    parameters:
+      - $ref: '#/components/parameters/RequestId'
+    post:
+      tags: [Quotes]
+      operationId: submitNmc
+      summary: Отправить расчёт НМЦ на проверку
+      x-roles: [STAFF]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SubmitForReview'
+      responses:
+        '201':
+          description: Задача проверки создана
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Approval'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /requests/{requestId}/tender:
+    parameters:
+      - $ref: '#/components/parameters/RequestId'
+    get:
+      tags: [Tender]
+      operationId: getTender
+      summary: Конкурсная документация, предложение победителя, договор
+      description: |
+        Генерация стартует автоматически после утверждения НМЦ. Возвращает черновики AI, выбор сотрудника и договор.
+        Формат выдаваемых документов (DOCX, PDF) на доске не определён, поэтому документы описаны ссылками на файлы Documents.
+      x-roles: [STAFF, REVIEWER]
+      responses:
+        '200':
+          description: Состояние конкурсного шага
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Tender'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /requests/{requestId}/tender/winner:
+    parameters:
+      - $ref: '#/components/parameters/RequestId'
+    put:
+      tags: [Tender]
+      operationId: selectWinner
+      summary: Выбрать победителя
+      description: Сотрудник принимает предложение AI или выбирает другое КП. Допустимо в состоянии DRAFT_READY или NEEDS_REWORK.
+      x-roles: [STAFF]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WinnerSelection'
+      responses:
+        '200':
+          description: Победитель выбран, договор подготовлен
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Tender'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /requests/{requestId}/package:
+    parameters:
+      - $ref: '#/components/parameters/RequestId'
+    get:
+      tags: [Package]
+      operationId: getPackage
+      summary: Пакет документов
+      description: |
+        ТЗ, форма КП, проект договора, протокол оценки. Скачивание всех документов или по одному идёт через Documents по `fileId`.
+      x-roles: [STAFF, REVIEWER]
+      responses:
+        '200':
+          description: Пакет
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProcurementPackage'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /requests/{requestId}/package/submit:
+    parameters:
+      - $ref: '#/components/parameters/RequestId'
+    post:
+      tags: [Package]
+      operationId: submitPackage
+      summary: Отправить пакет на утверждение
+      description: Допустимо после выбора победителя и подготовки договора.
+      x-roles: [STAFF]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SubmitForReview'
+      responses:
+        '201':
+          description: Задача проверки создана
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Approval'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /approvals:
+    get:
+      tags: [Approvals]
+      operationId: listApprovals
+      summary: Очередь на проверку
+      description: 'Что ждёт утверждения: ТЗ, НМЦ, пакет документов. Срочные заявки сверху.'
+      x-roles: [REVIEWER, STAFF]
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+        - name: state
+          in: query
+          schema:
+            $ref: '#/components/schemas/ApprovalState'
+        - name: subjectType
+          in: query
+          schema:
+            $ref: '#/components/schemas/ApprovalSubjectType'
+        - name: requestId
+          in: query
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Страница задач проверки
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApprovalPage'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /approvals/{approvalId}:
+    parameters:
+      - $ref: '#/components/parameters/ApprovalId'
+    get:
+      tags: [Approvals]
+      operationId: getApproval
+      summary: Экран проверки
+      description: Задача вместе с проверяемым объектом и предыдущими решениями по нему.
+      x-roles: [REVIEWER, STAFF]
+      responses:
+        '200':
+          description: Задача проверки
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApprovalDetail'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /approvals/{approvalId}/approve:
+    parameters:
+      - $ref: '#/components/parameters/ApprovalId'
+    post:
+      tags: [Approvals]
+      operationId: approve
+      summary: Утвердить
+      description: |
+        Только проверяющий. Если после отправки проверяемый объект изменился, `subjectVersion` не совпадёт и вернётся 409 STALE_VERSION.
+        Решение записывается в неизменяемый журнал согласований.
+      x-roles: [REVIEWER]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ApproveDecision'
+      responses:
+        '200':
+          description: Решение принято
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Approval'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /approvals/{approvalId}/reject:
+    parameters:
+      - $ref: '#/components/parameters/ApprovalId'
+    post:
+      tags: [Approvals]
+      operationId: reject
+      summary: Вернуть на доработку
+      description: |
+        Комментарий обязателен. Для ТЗ комментарий вместе с текущей версией уходит в AI, который готовит обновлённый черновик
+        (шаг возвращается в PROCESSING). Для НМЦ и пакета шаг возвращается в NEEDS_REWORK, сотрудник получает комментарий.
+      x-roles: [REVIEWER]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RejectDecision'
+      responses:
+        '200':
+          description: Решение принято
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Approval'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /approval-journal:
+    get:
+      tags: [Approvals]
+      operationId: listApprovalJournal
+      summary: Журнал согласований
+      description: Кто, что и когда утвердил или вернул. Записи неизменяемы.
+      x-roles: [REVIEWER, STAFF]
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+        - name: requestId
+          in: query
+          schema:
+            type: string
+            format: uuid
+        - name: subjectType
+          in: query
+          schema:
+            $ref: '#/components/schemas/ApprovalSubjectType'
+        - name: from
+          in: query
+          schema:
+            type: string
+            format: date-time
+        - name: to
+          in: query
+          schema:
+            type: string
+            format: date-time
+      responses:
+        '200':
+          description: Страница журнала
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JournalPage'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Access-токен, выданный Profiles & Access. Claims sub, org_id, roles. Срок жизни 5 минут.
+
+  parameters:
+    RequestId:
+      name: requestId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    QuoteId:
+      name: quoteId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    ApprovalId:
+      name: approvalId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    Limit:
+      name: limit
+      in: query
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 25
+    Cursor:
+      name: cursor
+      in: query
+      description: Непрозрачный курсор из `nextCursor` предыдущей страницы.
+      schema:
+        type: string
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: Уникальный ключ попытки. Повтор с тем же ключом (например, при плохой связи в PWA) возвращает уже созданную заявку.
+      schema:
+        type: string
+        minLength: 8
+        maxLength: 128
+
+  responses:
+    BadRequest:
+      description: Ошибка в запросе (VALIDATION_ERROR)
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Unauthorized:
+      description: Нет или просрочен токен. Фронтенд обновляет сессию и повторяет запрос один раз.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Forbidden:
+      description: Роль не допускает операцию (FORBIDDEN)
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    NotFound:
+      description: Не найдено, либо принадлежит другой организации (NOT_FOUND)
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Conflict:
+      description: Операция недопустима в текущем состоянии (STEP_NOT_ALLOWED) или версия устарела (STALE_VERSION)
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+
+  schemas:
+    Problem:
+      type: object
+      description: Формат ошибки по RFC 9457.
+      required: [type, title, status, code]
+      properties:
+        type:
+          type: string
+          default: about:blank
+        title:
+          type: string
+        status:
+          type: integer
+        detail:
+          type: string
+        code:
+          type: string
+          enum: [VALIDATION_ERROR, FORBIDDEN, NOT_FOUND, STEP_NOT_ALLOWED, STALE_VERSION, UNAUTHORIZED]
+        errors:
+          type: array
+          description: Ошибки по полям для VALIDATION_ERROR.
+          items:
+            type: object
+            required: [field, message]
+            properties:
+              field:
+                type: string
+              message:
+                type: string
+
+    # ---------- общие ----------
+    RequestStatus:
+      type: string
+      description: Статус, который видит житель. Когда заявка становится COMPLETED, на доске не определено (открытый вопрос, предположительно после утверждения пакета).
+      enum: [ACCEPTED, IN_PROGRESS, COMPLETED]
+    Urgency:
+      type: string
+      enum: [EMERGENCY, PLANNED]
+    ProcurementStep:
+      type: string
+      enum: [TRIAGE, TZ, QUOTES_NMC, TENDER, PACKAGE]
+    StepState:
+      type: string
+      enum: [NOT_STARTED, PROCESSING, DRAFT_READY, IN_REVIEW, NEEDS_REWORK, APPROVED, AI_FAILED]
+    ApprovalSubjectType:
+      type: string
+      enum: [TZ, NMC, PACKAGE]
+    ApprovalState:
+      type: string
+      enum: [PENDING, APPROVED, REJECTED]
+    UserRef:
+      type: object
+      required: [userId]
+      properties:
+        userId:
+          type: string
+        displayName:
+          type: string
+    FileRef:
+      type: object
+      required: [fileId, name, mediaType, sizeBytes]
+      properties:
+        fileId:
+          type: string
+          format: uuid
+          description: Идентификатор файла в Documents.
+        name:
+          type: string
+        mediaType:
+          type: string
+        sizeBytes:
+          type: integer
+          minimum: 0
+    Money:
+      type: object
+      required: [amount, currency]
+      properties:
+        amount:
+          type: string
+          pattern: '^-?\d+(\.\d{1,2})?$'
+          description: Десятичная строка, чтобы не терять точность.
+          examples: ['125000.50']
+        currency:
+          type: string
+          pattern: '^[A-Z]{3}$'
+          default: RUB
+    SubmitForReview:
+      type: object
+      required: [version]
+      properties:
+        version:
+          type: integer
+          description: Версия отправляемого объекта. Если она уже не текущая, ответ 409 STALE_VERSION.
+    Page:
+      type: object
+      required: [items]
+      properties:
+        nextCursor:
+          type: [string, 'null']
+    StepInfo:
+      type: object
+      required: [step, state, updatedAt]
+      properties:
+        step:
+          $ref: '#/components/schemas/ProcurementStep'
+        state:
+          $ref: '#/components/schemas/StepState'
+        updatedAt:
+          type: string
+          format: date-time
+
+    # ---------- заявки ----------
+    RequestCreate:
+      type: object
+      required: [description, entrance, photoFileIds]
+      properties:
+        description:
+          type: string
+          minLength: 3
+          maxLength: 2000
+          description: Пара слов о проблеме.
+        entrance:
+          type: string
+          maxLength: 20
+          description: Подъезд. Адрес берётся из профиля.
+        photoFileIds:
+          type: array
+          description: Идентификаторы фото из Documents. Допустимое число и размер задаются отдельной конфигурацией.
+          minItems: 1
+          items:
+            type: string
+            format: uuid
+    RequestSummary:
+      type: object
+      required: [id, status, address, entrance, createdAt, updatedAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        status:
+          $ref: '#/components/schemas/RequestStatus'
+        urgency:
+          oneOf:
+            - $ref: '#/components/schemas/Urgency'
+            - type: 'null'
+          description: Пусто, пока триаж не выполнен. Только для сотрудника и проверяющего.
+        currentStep:
+          oneOf:
+            - $ref: '#/components/schemas/ProcurementStep'
+            - type: 'null'
+          description: Только для сотрудника и проверяющего.
+        currentStepState:
+          oneOf:
+            - $ref: '#/components/schemas/StepState'
+            - type: 'null'
+        address:
+          type: string
+        entrance:
+          type: string
+        description:
+          type: string
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+    RequestDetail:
+      allOf:
+        - $ref: '#/components/schemas/RequestSummary'
+        - type: object
+          required: [photos]
+          properties:
+            photos:
+              type: array
+              items:
+                $ref: '#/components/schemas/FileRef'
+            author:
+              $ref: '#/components/schemas/UserRef'
+            steps:
+              type: array
+              description: Состояние всех шагов закупки. Только для сотрудника и проверяющего.
+              items:
+                $ref: '#/components/schemas/StepInfo'
+    RequestPage:
+      allOf:
+        - $ref: '#/components/schemas/Page'
+        - type: object
+          properties:
+            items:
+              type: array
+              items:
+                $ref: '#/components/schemas/RequestSummary'
+
+    # ---------- триаж ----------
+    TriageValues:
+      type: object
+      required: [urgency, workType, route]
+      properties:
+        urgency:
+          $ref: '#/components/schemas/Urgency'
+        workType:
+          type: string
+        route:
+          type: string
+          description: Маршрут заявки. Набор значений уточняется, должен совпасть с triage.route в контракте ai.results.
+    Triage:
+      type: object
+      required: [state]
+      properties:
+        state:
+          $ref: '#/components/schemas/StepState'
+        proposal:
+          oneOf:
+            - $ref: '#/components/schemas/TriageValues'
+            - type: 'null'
+          description: Предложение AI. Пусто, пока шаг в PROCESSING.
+        confirmed:
+          oneOf:
+            - $ref: '#/components/schemas/TriageValues'
+            - type: 'null'
+          description: Итоговое решение сотрудника.
+        confirmedBy:
+          $ref: '#/components/schemas/UserRef'
+        confirmedAt:
+          type: string
+          format: date-time
+    TriageDecision:
+      allOf:
+        - $ref: '#/components/schemas/TriageValues'
+
+    # ---------- ТЗ ----------
+    TzSection:
+      type: object
+      required: [id, title, text]
+      properties:
+        id:
+          type: string
+        title:
+          type: string
+        text:
+          type: string
+        sources:
+          type: array
+          description: Нормативные ссылки только из справочника.
+          items:
+            type: string
+        editedByStaff:
+          type: boolean
+    TzQuestion:
+      type: object
+      required: [id, text]
+      properties:
+        id:
+          type: string
+        text:
+          type: string
+        answer:
+          type: [string, 'null']
+    TzDocument:
+      type: object
+      required: [state, version]
+      properties:
+        state:
+          $ref: '#/components/schemas/StepState'
+        version:
+          type: integer
+          minimum: 0
+        sections:
+          type: array
+          items:
+            $ref: '#/components/schemas/TzSection'
+        openQuestions:
+          type: array
+          items:
+            $ref: '#/components/schemas/TzQuestion'
+        origin:
+          type: string
+          enum: [AI, STAFF]
+          description: Кто создал эту версию.
+        lastReviewComment:
+          type: [string, 'null']
+        updatedAt:
+          type: string
+          format: date-time
+    TzUpdate:
+      type: object
+      required: [baseVersion]
+      properties:
+        baseVersion:
+          type: integer
+        sections:
+          type: array
+          items:
+            type: object
+            required: [id, text]
+            properties:
+              id:
+                type: string
+              title:
+                type: string
+              text:
+                type: string
+        answers:
+          type: array
+          items:
+            type: object
+            required: [questionId, answer]
+            properties:
+              questionId:
+                type: string
+              answer:
+                type: string
+
+    # ---------- КП и НМЦ ----------
+    QuoteRequestCreate:
+      type: object
+      required: [contractorIds]
+      properties:
+        contractorIds:
+          type: array
+          minItems: 1
+          items:
+            type: string
+            format: uuid
+          description: Подрядчики из Reference Data.
+    QuoteRequestDraft:
+      type: object
+      required: [id, recipients, subject, body]
+      properties:
+        id:
+          type: string
+          format: uuid
+        recipients:
+          type: array
+          items:
+            type: object
+            required: [contractorId, name]
+            properties:
+              contractorId:
+                type: string
+                format: uuid
+              name:
+                type: string
+              email:
+                type: string
+        subject:
+          type: string
+        body:
+          type: string
+        attachments:
+          type: array
+          description: ТЗ и форма КП.
+          items:
+            $ref: '#/components/schemas/FileRef'
+    QuoteCreate:
+      type: object
+      required: [fileIds]
+      properties:
+        contractorId:
+          type: [string, 'null']
+          format: uuid
+          description: Если подрядчик неизвестен, название извлекается из документа.
+        fileIds:
+          type: array
+          minItems: 1
+          items:
+            type: string
+            format: uuid
+    QuoteItem:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+        quantity:
+          type: number
+        unit:
+          type: string
+        unitPrice:
+          $ref: '#/components/schemas/Money'
+        price:
+          $ref: '#/components/schemas/Money'
+    QuoteData:
+      type: object
+      properties:
+        contractorName:
+          type: string
+        totalPrice:
+          $ref: '#/components/schemas/Money'
+        termsDays:
+          type: integer
+          description: Срок выполнения в днях.
+        warranty:
+          type: string
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/QuoteItem'
+        discrepancies:
+          type: array
+          description: Подсказки AI по расхождениям.
+          items:
+            type: string
+    Quote:
+      type: object
+      required: [id, extraction, version, files]
+      properties:
+        id:
+          type: string
+          format: uuid
+        contractorId:
+          type: [string, 'null']
+          format: uuid
+        extraction:
+          type: string
+          enum: [EXTRACTING, EXTRACTED, AI_FAILED]
+        version:
+          type: integer
+        files:
+          type: array
+          items:
+            $ref: '#/components/schemas/FileRef'
+        data:
+          oneOf:
+            - $ref: '#/components/schemas/QuoteData'
+            - type: 'null'
+        editedByStaff:
+          type: boolean
+        createdAt:
+          type: string
+          format: date-time
+    QuoteDataUpdate:
+      type: object
+      required: [baseVersion, data]
+      properties:
+        baseVersion:
+          type: integer
+        contractorId:
+          type: [string, 'null']
+          format: uuid
+        data:
+          $ref: '#/components/schemas/QuoteData'
+    QuoteComparison:
+      type: object
+      required: [quotes, rows]
+      properties:
+        quotes:
+          type: array
+          items:
+            type: object
+            required: [quoteId, contractorName]
+            properties:
+              quoteId:
+                type: string
+                format: uuid
+              contractorName:
+                type: string
+              totalPrice:
+                $ref: '#/components/schemas/Money'
+              termsDays:
+                type: integer
+              warranty:
+                type: string
+        rows:
+          type: array
+          items:
+            type: object
+            required: [name, cells]
+            properties:
+              name:
+                type: string
+              unit:
+                type: string
+              quantity:
+                type: number
+              cells:
+                type: array
+                items:
+                  type: object
+                  required: [quoteId, flag]
+                  properties:
+                    quoteId:
+                      type: string
+                      format: uuid
+                    unitPrice:
+                      $ref: '#/components/schemas/Money'
+                    price:
+                      $ref: '#/components/schemas/Money'
+                    flag:
+                      type: string
+                      enum: [NONE, MISSING, MISMATCH, OUTLIER]
+                    note:
+                      type: string
+        discrepancies:
+          type: array
+          items:
+            type: string
+    NmcCalculateRequest:
+      type: object
+      properties:
+        method:
+          type: string
+          description: Метод расчёта. Допустимые значения определятся ответом заказчика (44-ФЗ, 223-ФЗ или внутреннее положение).
+        quoteIds:
+          type: array
+          description: Какие КП учитывать. По умолчанию все.
+          items:
+            type: string
+            format: uuid
+    NmcCalculation:
+      type: object
+      required: [state, version]
+      properties:
+        state:
+          $ref: '#/components/schemas/StepState'
+        version:
+          type: integer
+          minimum: 0
+        method:
+          type: string
+        amount:
+          $ref: '#/components/schemas/Money'
+        justification:
+          type: string
+          description: Обоснование расчёта.
+        quoteIds:
+          type: array
+          items:
+            type: string
+            format: uuid
+        lastReviewComment:
+          type: [string, 'null']
+        calculatedAt:
+          type: string
+          format: date-time
+
+    # ---------- конкурс, договор, пакет ----------
+    DocumentRef:
+      type: object
+      required: [kind, name]
+      properties:
+        kind:
+          type: string
+          enum: [TZ, QUOTE_FORM, TENDER_DOCUMENTATION, EVALUATION_PROTOCOL, CONTRACT]
+        name:
+          type: string
+        fileId:
+          type: [string, 'null']
+          format: uuid
+          description: Пусто, пока документ не собран в Documents.
+        version:
+          type: integer
+    WinnerProposal:
+      type: object
+      required: [quoteId, rationale]
+      properties:
+        quoteId:
+          type: string
+          format: uuid
+        rationale:
+          type: string
+        scores:
+          type: array
+          description: Оценки по критериям.
+          items:
+            type: object
+            required: [quoteId, criterion, score]
+            properties:
+              quoteId:
+                type: string
+                format: uuid
+              criterion:
+                type: string
+              score:
+                type: number
+    ContractDraft:
+      type: object
+      required: [type]
+      properties:
+        type:
+          type: string
+          enum: [STANDARD, NON_STANDARD]
+          description: Типовой договор берётся из библиотеки, нетиповой готовит AI с пометками для юриста.
+        document:
+          $ref: '#/components/schemas/DocumentRef'
+        lawyerNotes:
+          type: array
+          description: Проверка юристом на доске не описана, пометки лишь показываются.
+          items:
+            type: string
+    Tender:
+      type: object
+      required: [state]
+      properties:
+        state:
+          $ref: '#/components/schemas/StepState'
+        documents:
+          type: array
+          description: Конкурсная документация и протокол оценки.
+          items:
+            $ref: '#/components/schemas/DocumentRef'
+        winnerProposal:
+          oneOf:
+            - $ref: '#/components/schemas/WinnerProposal'
+            - type: 'null'
+        selectedWinner:
+          oneOf:
+            - type: object
+              required: [quoteId, selectedBy, selectedAt]
+              properties:
+                quoteId:
+                  type: string
+                  format: uuid
+                selectedBy:
+                  $ref: '#/components/schemas/UserRef'
+                selectedAt:
+                  type: string
+                  format: date-time
+                comment:
+                  type: string
+            - type: 'null'
+        contract:
+          oneOf:
+            - $ref: '#/components/schemas/ContractDraft'
+            - type: 'null'
+        lastReviewComment:
+          type: [string, 'null']
+    WinnerSelection:
+      type: object
+      required: [quoteId]
+      properties:
+        quoteId:
+          type: string
+          format: uuid
+        comment:
+          type: string
+          description: Желательно, если выбран не тот победитель, которого предложил AI.
+    ProcurementPackage:
+      type: object
+      required: [state, documents]
+      properties:
+        state:
+          $ref: '#/components/schemas/StepState'
+        documents:
+          type: array
+          description: ТЗ, форма КП, проект договора, протокол оценки.
+          items:
+            $ref: '#/components/schemas/DocumentRef'
+        approvedAt:
+          type: [string, 'null']
+          format: date-time
+        lastReviewComment:
+          type: [string, 'null']
+
+    # ---------- согласования ----------
+    Approval:
+      type: object
+      required: [id, requestId, subjectType, subjectVersion, state, submittedBy, submittedAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        requestId:
+          type: string
+          format: uuid
+        subjectType:
+          $ref: '#/components/schemas/ApprovalSubjectType'
+        subjectVersion:
+          type: integer
+        state:
+          $ref: '#/components/schemas/ApprovalState'
+        urgency:
+          oneOf:
+            - $ref: '#/components/schemas/Urgency'
+            - type: 'null'
+        address:
+          type: string
+        submittedBy:
+          $ref: '#/components/schemas/UserRef'
+        submittedAt:
+          type: string
+          format: date-time
+        decidedBy:
+          $ref: '#/components/schemas/UserRef'
+        decidedAt:
+          type: string
+          format: date-time
+        comment:
+          type: [string, 'null']
+    ApprovalDetail:
+      allOf:
+        - $ref: '#/components/schemas/Approval'
+        - type: object
+          required: [subject]
+          properties:
+            subject:
+              description: Проверяемый объект. Тип определяется полем subjectType (TZ, NMC или PACKAGE).
+              oneOf:
+                - $ref: '#/components/schemas/TzDocument'
+                - $ref: '#/components/schemas/NmcCalculation'
+                - $ref: '#/components/schemas/ProcurementPackage'
+            previousDecisions:
+              type: array
+              items:
+                $ref: '#/components/schemas/JournalEntry'
+    ApprovalPage:
+      allOf:
+        - $ref: '#/components/schemas/Page'
+        - type: object
+          properties:
+            items:
+              type: array
+              items:
+                $ref: '#/components/schemas/Approval'
+    ApproveDecision:
+      type: object
+      required: [subjectVersion]
+      properties:
+        subjectVersion:
+          type: integer
+        comment:
+          type: string
+    RejectDecision:
+      type: object
+      required: [subjectVersion, comment]
+      properties:
+        subjectVersion:
+          type: integer
+        comment:
+          type: string
+          minLength: 1
+          maxLength: 2000
+    JournalEntry:
+      type: object
+      required: [id, requestId, subjectType, subjectVersion, decision, decidedBy, decidedAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        requestId:
+          type: string
+          format: uuid
+        subjectType:
+          $ref: '#/components/schemas/ApprovalSubjectType'
+        subjectVersion:
+          type: integer
+        decision:
+          type: string
+          enum: [APPROVED, REJECTED]
+        decidedBy:
+          $ref: '#/components/schemas/UserRef'
+        decidedAt:
+          type: string
+          format: date-time
+        comment:
+          type: [string, 'null']
+    JournalPage:
+      allOf:
+        - $ref: '#/components/schemas/Page'
+        - type: object
+          properties:
+            items:
+              type: array
+              items:
+                $ref: '#/components/schemas/JournalEntry'

@@ -1,0 +1,84 @@
+@import "tailwindcss";
+@import "@fontsource-variable/onest/wght.css";
+@import "@fontsource-variable/unbounded/wght.css";
+
+/* Design tokens from the Figma mockup (YKit, page "Компоненты YKit" and "Брендинг"). The only place with values. */
+@theme {
+  --color-bg: #f5f7fb;
+  --color-surface: #ffffff;
+  --color-surface-2: #e6eaf2;
+  --color-border: #e6eaf2;
+  --color-text: #101828;
+  --color-text-2: #5b6475;
+  --color-accent: #2f54eb;
+  --color-accent-ink: #2f54eb;
+  --color-accent-tint: #e4eafd;
+  --color-on-accent: #ffffff;
+  --color-accent-2: #0d9488;
+  --color-accent-2-ink: #0b7a70;
+  --color-accent-2-tint: #ddf3f0;
+  /* not in the mockup tokens: error states (see docs/DECISIONS.md) */
+  --color-danger-ink: #b42318;
+  --color-danger-tint: #fde8e6;
+
+  --font-sans: "Onest Variable", system-ui, sans-serif;
+  --font-display: "Unbounded Variable", "Onest Variable", system-ui, sans-serif;
+
+  --text-body: 16px;
+  --text-small: 14px;
+  --text-caption: 12px;
+  --radius-card: 24px;
+  --radius-field: 12px;
+}
+
+html,
+body {
+  background: var(--color-bg);
+  color: var(--color-text);
+  font-family: var(--font-sans);
+  font-size: 16px;
+  line-height: 1.5;
+}
+
+h1,
+h2,
+h3 {
+  font-family: var(--font-display);
+}
+
+.scroll-x {
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.scroll-x::-webkit-scrollbar {
+  display: none;
+}
+
+@layer components {
+  .field {
+    width: 100%;
+    background: var(--color-surface);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-field);
+    padding: 12px 16px;
+    font-size: 16px;
+    color: var(--color-text);
+  }
+  .field::placeholder {
+    color: var(--color-text-2);
+  }
+  .field:focus-visible {
+    outline: 2px solid var(--color-accent);
+    outline-offset: 1px;
+  }
+  .field-label {
+    display: block;
+    font-size: 14px;
+    color: var(--color-text-2);
+    margin-bottom: 4px;
+  }
+  .caption-note {
+    font-size: 12px;
+    color: var(--color-accent-ink);
+  }
+}
